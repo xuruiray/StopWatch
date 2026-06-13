@@ -19,7 +19,7 @@ public:
     ~RatchetView();
 
     void init(lv_obj_t* parent);
-    void update();
+    void update(bool leftButtonPressed = false, bool rightButtonPressed = false, bool bothButtonsPressed = false);
 
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
@@ -39,15 +39,23 @@ private:
 
     bool _dragging          = false;
     float _display_rotation_deg = 0.0f;
+    float _angular_velocity_deg_s = 0.0f;
     float _last_touch_angle = 0.0f;
     int _last_tooth_index   = 0;
     bool _has_feedback      = false;
     uint32_t _last_feedback_tick = 0;
+    uint32_t _last_motion_tick = 0;
+    uint32_t _last_touch_tick = 0;
+    uint32_t _last_drag_motion_tick = 0;
     int _last_frame_index = -1;
+    bool _inertia_active = false;
     TaskHandle_t _gear_builder_task = nullptr;
     std::atomic_bool _gear_builder_stop { false };
 
-    void updateTouch();
+    void updateTouch(uint32_t now);
+    void updateButtonInput(uint32_t now, bool leftButtonPressed, bool rightButtonPressed, bool bothButtonsPressed);
+    void updateInertia(uint32_t now);
+    void stopMotion(bool stopFeedback = false);
     void applyGearFrame(bool force = false);
     void applyNotchTransform();
     void renderGearFrame(int frame);

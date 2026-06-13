@@ -38,15 +38,20 @@ void AppRatchet::onOpen()
 
 void AppRatchet::onRunning()
 {
-    if (_key_manager && _key_manager->update() == input::KeyEvent::GoHome) {
+    GetHAL().updateButtonStates();
+    if (_key_manager && _key_manager->update(false) == input::KeyEvent::GoHome) {
         close();
         return;
     }
 
+    const bool both_buttons_pressed = GetHAL().btnA.isPressed() && GetHAL().btnB.isPressed();
+    const bool left_button_pressed  = !both_buttons_pressed && GetHAL().btnA.wasPressed();
+    const bool right_button_pressed = !both_buttons_pressed && GetHAL().btnB.wasPressed();
+
     LvglLockGuard lock;
 
     if (_view) {
-        _view->update();
+        _view->update(left_button_pressed, right_button_pressed, both_buttons_pressed);
     }
 }
 

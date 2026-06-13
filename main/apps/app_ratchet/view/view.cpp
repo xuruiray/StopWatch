@@ -35,11 +35,22 @@ constexpr int _notch_pivot_x              = _notch_width / 2;
 constexpr int _notch_pivot_y              = _notch_height / 2;
 constexpr int _notch_orbit_radius         = 36;
 constexpr float _tooth_angle_deg          = 360.0f / static_cast<float>(_gear_teeth);
-constexpr uint32_t _feedback_interval_ms  = 50;
+constexpr uint32_t _feedback_interval_ms  = 120;
 constexpr uint16_t _vibrate_duration_ms   = 20;
 constexpr uint8_t _vibrate_strength       = 90;
 constexpr uint32_t _bg_color              = 0x000000;
 constexpr float _pi                       = 3.14159265358979323846f;
+constexpr float _velocity_filter_keep     = 0.65f;
+constexpr float _velocity_filter_new      = 0.35f;
+constexpr float _max_angular_velocity_deg_s = 1200.0f;
+constexpr float _inertia_release_boost        = 1.10f;
+constexpr float _inertia_start_velocity_deg_s = 65.0f;
+constexpr float _inertia_stop_velocity_deg_s  = 26.0f;
+constexpr float _inertia_base_decel_deg_s2    = 430.0f;
+constexpr float _inertia_speed_decel_ratio    = 0.42f;
+constexpr uint32_t _release_velocity_grace_ms = 180;
+constexpr uint32_t _drag_idle_damping_delay_ms = 120;
+constexpr uint32_t _max_inertia_step_ms       = 50;
 constexpr int _gear_builder_stack_size    = 6144;
 constexpr UBaseType_t _gear_builder_priority = tskIDLE_PRIORITY + 1;
 constexpr int _gear_builder_yield_rows    = 8;
@@ -663,23 +674,31 @@ void RatchetView::init(lv_obj_t* parent)
     _touch_mask->moveForeground();
 
     _last_tooth_index = tooth_index_for_rotation(_display_rotation_deg);
+    _last_motion_tick = GetHAL().millis();
+    _last_touch_tick  = _last_motion_tick;
+    _last_drag_motion_tick = _last_motion_tick;
     applyGearFrame(true);
     applyNotchTransform();
     startGearBuilderTask();
 }
 
-void RatchetView::update()
+void RatchetView::update(bool leftButtonPressed, bool rightButtonPressed, bool bothButtonsPressed)
 {
-    updateTouch();
+    const uint32_t now = GetHAL().millis();
+    updateTouch(now);
+    updateButtonInput(now, leftButtonPressed, rightButtonPressed, bothButtonsPressed);
+    updateInertia(now);
     applyGearFrame();
     applyNotchTransform();
 }
 
-void RatchetView::updateTouch()
+void RatchetView::updateTouch(uint32_t now)
 {
     lv_indev_t* indev = GetHAL().lvTouchpad;
     if (indev == nullptr) {
         _dragging = false;
+        _inertia_active = false;
+        _angular_velocity_deg_s = 0.0f;
         return;
     }
 
@@ -688,7 +707,22 @@ void RatchetView::updateTouch()
     lv_indev_get_point(indev, &point);
 
     if (!is_pressed) {
-        _dragging = false;
+        if (_dragging) {
+            _dragging = false;
+            const bool has_recent_motion =
+                (now - _last_drag_motion_tick) <= _release_velocity_grace_ms;
+            _angular_velocity_deg_s =
+                std::clamp(_angular_velocity_deg_s * _inertia_release_boost,
+                           -_max_angular_velocity_deg_s,
+                           _max_angular_velocity_deg_s);
+            if (has_recent_motion && std::fabs(_angular_velocity_deg_s) >= _inertia_start_velocity_deg_s) {
+                _inertia_active   = true;
+                _last_motion_tick = now;
+            } else {
+                _inertia_active = false;
+                _angular_velocity_deg_s = 0.0f;
+            }
+        }
         return;
     }
 
@@ -696,9 +730,14 @@ void RatchetView::updateTouch()
         if (!isTouchOnGear(point)) {
             return;
         }
-        _dragging             = true;
-        _last_touch_angle     = touchAngleDegrees(point);
-        _last_tooth_index     = tooth_index_for_rotation(_display_rotation_deg);
+        _dragging               = true;
+        _inertia_active         = false;
+        _angular_velocity_deg_s = 0.0f;
+        _last_touch_angle       = touchAngleDegrees(point);
+        _last_touch_tick        = now;
+        _last_motion_tick       = now;
+        _last_drag_motion_tick  = now;
+        _last_tooth_index       = tooth_index_for_rotation(_display_rotation_deg);
         return;
     }
 
@@ -706,15 +745,116 @@ void RatchetView::updateTouch()
     const float delta         = normalize_delta_degrees(current_angle - _last_touch_angle);
     _last_touch_angle         = current_angle;
 
+    const uint32_t elapsed_ms = std::max<uint32_t>(1, now - _last_touch_tick);
+    _last_touch_tick          = now;
+    const float elapsed_sec   = static_cast<float>(elapsed_ms) / 1000.0f;
+
     if (std::fabs(delta) < 0.01f) {
+        if ((now - _last_drag_motion_tick) > _drag_idle_damping_delay_ms) {
+            _angular_velocity_deg_s *= 0.92f;
+        }
+        if (std::fabs(_angular_velocity_deg_s) < 5.0f) {
+            _angular_velocity_deg_s = 0.0f;
+        }
         return;
     }
+
+    const float instant_velocity = std::clamp(delta / elapsed_sec,
+                                              -_max_angular_velocity_deg_s,
+                                              _max_angular_velocity_deg_s);
+    _angular_velocity_deg_s =
+        std::clamp((_angular_velocity_deg_s * _velocity_filter_keep) +
+                       (instant_velocity * _velocity_filter_new),
+                   -_max_angular_velocity_deg_s,
+                   _max_angular_velocity_deg_s);
+    _last_drag_motion_tick = now;
 
     _display_rotation_deg += delta;
     if (std::fabs(_display_rotation_deg) > 36000.0f) {
         _display_rotation_deg = std::fmod(_display_rotation_deg, 360.0f);
     }
     updateToothFeedback();
+}
+
+void RatchetView::updateButtonInput(uint32_t now, bool leftButtonPressed, bool rightButtonPressed, bool bothButtonsPressed)
+{
+    if (!leftButtonPressed && !rightButtonPressed && !bothButtonsPressed) {
+        return;
+    }
+
+    if (_dragging) {
+        return;
+    }
+
+    if (_inertia_active && bothButtonsPressed) {
+        stopMotion(true);
+        return;
+    }
+
+    if (bothButtonsPressed) {
+        return;
+    }
+
+    _angular_velocity_deg_s = leftButtonPressed ? -_max_angular_velocity_deg_s : _max_angular_velocity_deg_s;
+    _inertia_active         = true;
+    _last_motion_tick       = now;
+    _last_drag_motion_tick  = now;
+    _last_tooth_index       = tooth_index_for_rotation(_display_rotation_deg);
+}
+
+void RatchetView::updateInertia(uint32_t now)
+{
+    if (!_inertia_active || _dragging) {
+        return;
+    }
+
+    if (_last_motion_tick == 0) {
+        _last_motion_tick = now;
+        return;
+    }
+
+    const uint32_t elapsed_ms = now - _last_motion_tick;
+    if (elapsed_ms == 0) {
+        return;
+    }
+    _last_motion_tick = now;
+
+    const float elapsed_sec =
+        static_cast<float>(std::min<uint32_t>(elapsed_ms, _max_inertia_step_ms)) / 1000.0f;
+    const float speed = std::fabs(_angular_velocity_deg_s);
+    if (speed < _inertia_stop_velocity_deg_s) {
+        _inertia_active = false;
+        _angular_velocity_deg_s = 0.0f;
+        return;
+    }
+
+    _display_rotation_deg += _angular_velocity_deg_s * elapsed_sec;
+    if (std::fabs(_display_rotation_deg) > 36000.0f) {
+        _display_rotation_deg = std::fmod(_display_rotation_deg, 360.0f);
+    }
+    updateToothFeedback();
+
+    const float decel = _inertia_base_decel_deg_s2 + (speed * _inertia_speed_decel_ratio);
+    const float next_speed = std::max(0.0f, speed - (decel * elapsed_sec));
+    if (next_speed < _inertia_stop_velocity_deg_s) {
+        _inertia_active = false;
+        _angular_velocity_deg_s = 0.0f;
+        return;
+    }
+
+    _angular_velocity_deg_s = (_angular_velocity_deg_s > 0.0f) ? next_speed : -next_speed;
+}
+
+void RatchetView::stopMotion(bool stopFeedback)
+{
+    _inertia_active = false;
+    _angular_velocity_deg_s = 0.0f;
+
+    if (stopFeedback) {
+        GetHAL().stopVibrate();
+        std::vector<int16_t> empty_audio;
+        GetHAL().audioPlay(empty_audio, true);
+    }
 }
 
 void RatchetView::applyGearFrame(bool force)
