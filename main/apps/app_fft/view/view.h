@@ -22,6 +22,7 @@ public:
     void init(lv_obj_t* parent);
     void setSpectrum(const SpectrumBands& bands);
     void setPeakFrequencyHz(float frequencyHz);
+    void setCenterText(const char* valueText, const char* unitText);
     void update();
     const SpectrumBands& displayBands() const
     {

@@ -5,8 +5,11 @@
  */
 #include "hal.h"
 #include "utils/settings/settings.h"
+#include "sdkconfig.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <mooncake_log.h>
 #include <driver/i2s_std.h>
@@ -16,6 +19,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mutex>
+#include <usb_device_uac.h>
 
 static const std::string_view _tag = "HAL-Audio";
 
@@ -37,6 +41,7 @@ public:
         _silence_buffer.resize(sample_rate * 0.1);
         _silence_buffer.assign(_silence_buffer.size(), 0);
         _spectrum_init();
+        _usb_spectrum_init();
         xTaskCreate([](void* obj) { static_cast<AudioCodec*>(obj)->_task_entry(); }, "audio_task", 4 * 1024, this, 5,
                     &_task_handle);
 
@@ -152,7 +157,143 @@ public:
         }
     }
 
+    bool startUsbMic()
+    {
+        if (_usb_mic_ready.load()) {
+            _usb_mic_muted.store(false);
+            return true;
+        }
+
+        if (_usb_mic_start_attempted.load()) {
+            return false;
+        }
+
+        _usb_mic_start_attempted.store(true);
+
+        uac_device_config_t config = {};
+        config.input_cb            = &AudioCodec::_usb_mic_input_cb;
+        config.cb_ctx              = this;
+
+        esp_err_t ret = uac_device_init(&config);
+        if (ret != ESP_OK) {
+            mclog::tagError(_tag, "usb mic init failed: {}", ret);
+            _usb_mic_error.store(true);
+            return false;
+        }
+
+        mclog::tagInfo(_tag, "usb mic started, {} Hz", CONFIG_UAC_SAMPLE_RATE);
+        _usb_mic_error.store(false);
+        _usb_mic_ready.store(true);
+        _usb_mic_muted.store(false);
+        return true;
+    }
+
+    void setUsbMicMuted(bool muted)
+    {
+        _usb_mic_muted.store(muted);
+        if (muted) {
+            _clear_usb_spectrum();
+        }
+    }
+
+    bool isUsbMicMuted() const
+    {
+        return _usb_mic_muted.load();
+    }
+
+    bool isUsbMicReady() const
+    {
+        return _usb_mic_ready.load() && !_usb_mic_error.load();
+    }
+
+    Hal::AudioSpectrumFrame getUsbMicSpectrum()
+    {
+        std::lock_guard<std::mutex> lock(_usb_spectrum_mutex);
+        return _usb_mic_spectrum;
+    }
+
 private:
+    static esp_err_t _usb_mic_input_cb(uint8_t* buf, size_t len, size_t* bytes_read, void* ctx)
+    {
+        if (ctx == nullptr) {
+            if (bytes_read) {
+                *bytes_read = 0;
+            }
+            return ESP_FAIL;
+        }
+        return static_cast<AudioCodec*>(ctx)->_handle_usb_mic_input(buf, len, bytes_read);
+    }
+
+    esp_err_t _handle_usb_mic_input(uint8_t* buf, size_t len, size_t* bytes_read)
+    {
+        if (bytes_read) {
+            *bytes_read = len;
+        }
+
+        if (buf == nullptr || (len % sizeof(int16_t)) != 0) {
+            return ESP_FAIL;
+        }
+
+        auto* out        = reinterpret_cast<int16_t*>(buf);
+        size_t out_count = len / sizeof(int16_t);
+
+        if (_usb_mic_muted.load()) {
+            std::memset(buf, 0, len);
+            _append_usb_spectrum_samples(out, out_count);
+            return ESP_OK;
+        }
+
+        if (!_read_resampled_usb_mic(out, out_count)) {
+            std::memset(buf, 0, len);
+            _usb_mic_error.store(true);
+        } else {
+            _usb_mic_error.store(false);
+        }
+
+        _append_usb_spectrum_samples(out, out_count);
+        return ESP_OK;
+    }
+
+    bool _read_resampled_usb_mic(int16_t* out, size_t out_count)
+    {
+        if (out_count == 0) {
+            return true;
+        }
+
+        if constexpr (sample_rate == CONFIG_UAC_SAMPLE_RATE) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            return esp_codec_dev_read(_codec_dev, out, out_count * sizeof(int16_t)) == ESP_OK;
+        } else {
+            const double source_per_output = static_cast<double>(sample_rate) / static_cast<double>(CONFIG_UAC_SAMPLE_RATE);
+            const size_t source_count =
+                static_cast<size_t>(std::ceil(static_cast<double>(out_count) * source_per_output)) + 2;
+
+            _usb_mic_source_buffer.resize(source_count);
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                esp_err_t ret =
+                    esp_codec_dev_read(_codec_dev, _usb_mic_source_buffer.data(), source_count * sizeof(int16_t));
+                if (ret != ESP_OK) {
+                    return false;
+                }
+            }
+
+            for (size_t i = 0; i < out_count; ++i) {
+                const double pos = static_cast<double>(i) * source_per_output;
+                size_t idx       = static_cast<size_t>(pos);
+                if (idx + 1 >= _usb_mic_source_buffer.size()) {
+                    idx = _usb_mic_source_buffer.size() - 2;
+                }
+                const float frac = static_cast<float>(pos - static_cast<double>(idx));
+                const float s0   = static_cast<float>(_usb_mic_source_buffer[idx]);
+                const float s1   = static_cast<float>(_usb_mic_source_buffer[idx + 1]);
+                out[i]           = static_cast<int16_t>(std::lround(s0 + (s1 - s0) * frac));
+            }
+
+            return true;
+        }
+    }
+
     void _task_entry()
     {
         mclog::tagInfo(_tag, "start audio play task");
@@ -272,6 +413,28 @@ private:
         }
         _band_bin_edges[Hal::AudioSpectrumFrame::bandCount] = max_bin;
         _spectrum_available                                 = true;
+    }
+
+    void _usb_spectrum_init()
+    {
+        constexpr int max_bin = spectrum_fft_size / 2;
+        const float sample_rate_hz = static_cast<float>(CONFIG_UAC_SAMPLE_RATE);
+        const float nyquist        = sample_rate_hz * 0.5f;
+        const float min_hz         = sample_rate_hz / static_cast<float>(spectrum_fft_size);
+        const float log_min        = std::log10(min_hz);
+        const float log_max        = std::log10(nyquist);
+
+        _usb_band_bin_edges[0] = 1;
+        for (std::size_t i = 1; i < Hal::AudioSpectrumFrame::bandCount; ++i) {
+            float t            = static_cast<float>(i) / static_cast<float>(Hal::AudioSpectrumFrame::bandCount);
+            float edge_hz      = std::pow(10.0f, log_min + (log_max - log_min) * t);
+            int edge_bin       = static_cast<int>(std::lround(edge_hz * spectrum_fft_size / sample_rate_hz));
+            int min_edge       = _usb_band_bin_edges[i - 1] + 1;
+            int max_edge       = max_bin - static_cast<int>(Hal::AudioSpectrumFrame::bandCount - i);
+            _usb_band_bin_edges[i] = std::clamp(edge_bin, min_edge, max_edge);
+        }
+        _usb_band_bin_edges[Hal::AudioSpectrumFrame::bandCount] = max_bin;
+        _usb_spectrum_available                                 = true;
     }
 
     bool _read_spectrum_hop()
@@ -409,6 +572,160 @@ private:
         }
     }
 
+    void _append_usb_spectrum_samples(const int16_t* samples, size_t count)
+    {
+        if (!_usb_spectrum_available || samples == nullptr || count == 0) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(_usb_spectrum_mutex);
+
+        if (count >= spectrum_fft_size) {
+            const int16_t* start = samples + count - spectrum_fft_size;
+            for (int i = 0; i < spectrum_fft_size; ++i) {
+                _usb_spectrum_time_domain[i] = static_cast<float>(start[i]) / 32768.0f;
+            }
+            _usb_spectrum_samples_ready = spectrum_fft_size;
+        } else {
+            std::move(_usb_spectrum_time_domain.begin() + count, _usb_spectrum_time_domain.end(),
+                      _usb_spectrum_time_domain.begin());
+            for (size_t i = 0; i < count; ++i) {
+                _usb_spectrum_time_domain[spectrum_fft_size - count + i] = static_cast<float>(samples[i]) / 32768.0f;
+            }
+            _usb_spectrum_samples_ready = std::min<std::size_t>(_usb_spectrum_samples_ready + count, spectrum_fft_size);
+        }
+
+        if (_usb_spectrum_samples_ready >= spectrum_fft_size) {
+            Hal::AudioSpectrumFrame frame;
+            _process_usb_spectrum_frame(frame);
+            _usb_mic_spectrum = frame;
+        }
+    }
+
+    void _clear_usb_spectrum()
+    {
+        std::lock_guard<std::mutex> lock(_usb_spectrum_mutex);
+
+        _usb_spectrum_time_domain.fill(0.0f);
+        _usb_spectrum_raw_bands.fill(0.0f);
+        _usb_spectrum_smoothed_bands.fill(0.0f);
+        _usb_spectrum_noise_floor.fill(0.0f);
+        _usb_spectrum_normalization_level = 0.03f;
+        _usb_spectrum_samples_ready       = 0;
+        _usb_mic_spectrum = {};
+    }
+
+    void _process_usb_spectrum_frame(Hal::AudioSpectrumFrame& frame)
+    {
+        float mean = 0.0f;
+        for (float sample : _usb_spectrum_time_domain) {
+            mean += sample;
+        }
+        mean /= static_cast<float>(spectrum_fft_size);
+
+        for (int i = 0; i < spectrum_fft_size; ++i) {
+            float sample                        = (_usb_spectrum_time_domain[i] - mean) * _spectrum_window[i];
+            _usb_spectrum_fft_buffer[i * 2]     = sample;
+            _usb_spectrum_fft_buffer[i * 2 + 1] = 0.0f;
+        }
+
+        if (dsps_fft2r_fc32(_usb_spectrum_fft_buffer.data(), spectrum_fft_size) != ESP_OK) {
+            return;
+        }
+        if (dsps_bit_rev_fc32(_usb_spectrum_fft_buffer.data(), spectrum_fft_size) != ESP_OK) {
+            return;
+        }
+
+        float peak_bin_magnitude = 0.0f;
+        int peak_bin_index       = 0;
+        float top1               = 0.0f;
+        float top2               = 0.0f;
+        float top3               = 0.0f;
+
+        for (std::size_t band = 0; band < Hal::AudioSpectrumFrame::bandCount; ++band) {
+            int start_bin = _usb_band_bin_edges[band];
+            int end_bin   = _usb_band_bin_edges[band + 1];
+            float energy  = 0.0f;
+            float peak    = 0.0f;
+            int count     = 0;
+
+            for (int bin = start_bin; bin < end_bin; ++bin) {
+                float re  = _usb_spectrum_fft_buffer[bin * 2];
+                float im  = _usb_spectrum_fft_buffer[bin * 2 + 1];
+                float mag = std::sqrt(re * re + im * im) * (2.0f / static_cast<float>(spectrum_fft_size));
+                if (mag > peak_bin_magnitude) {
+                    peak_bin_magnitude = mag;
+                    peak_bin_index     = bin;
+                }
+                peak = std::max(peak, mag);
+                energy += mag * mag;
+                ++count;
+            }
+
+            float rms = count > 0 ? std::sqrt(energy / static_cast<float>(count)) : 0.0f;
+            float raw = rms * 0.48f + peak * 0.52f;
+            float low_emphasis =
+                1.12f - 0.22f * (static_cast<float>(band) / static_cast<float>(Hal::AudioSpectrumFrame::bandCount - 1));
+            raw *= low_emphasis;
+
+            float floor_alpha = raw < _usb_spectrum_noise_floor[band] ? 0.45f : 0.004f;
+            _usb_spectrum_noise_floor[band] += (raw - _usb_spectrum_noise_floor[band]) * floor_alpha;
+            raw                           = std::max(raw - (_usb_spectrum_noise_floor[band] * 2.20f + 0.0018f), 0.0f);
+            _usb_spectrum_raw_bands[band] = raw;
+
+            if (raw >= top1) {
+                top3 = top2;
+                top2 = top1;
+                top1 = raw;
+            } else if (raw >= top2) {
+                top3 = top2;
+                top2 = raw;
+            } else if (raw > top3) {
+                top3 = raw;
+            }
+        }
+
+        float frame_reference = std::max(top1 * 0.80f + top2 * 0.14f + top3 * 0.06f, 0.0015f);
+        float norm_alpha      = frame_reference > _usb_spectrum_normalization_level ? 0.44f : 0.16f;
+        _usb_spectrum_normalization_level += (frame_reference - _usb_spectrum_normalization_level) * norm_alpha;
+        _usb_spectrum_normalization_level = std::clamp(_usb_spectrum_normalization_level, 0.0015f, 1.0f);
+
+        if (peak_bin_magnitude > 0.0f) {
+            float refined_bin = static_cast<float>(peak_bin_index);
+            if (peak_bin_index > 1 && peak_bin_index < (spectrum_fft_size / 2 - 1)) {
+                float left_re      = _usb_spectrum_fft_buffer[(peak_bin_index - 1) * 2];
+                float left_im      = _usb_spectrum_fft_buffer[(peak_bin_index - 1) * 2 + 1];
+                float right_re     = _usb_spectrum_fft_buffer[(peak_bin_index + 1) * 2];
+                float right_im     = _usb_spectrum_fft_buffer[(peak_bin_index + 1) * 2 + 1];
+                float center_power = peak_bin_magnitude * peak_bin_magnitude;
+                float left_power   = left_re * left_re + left_im * left_im;
+                float right_power  = right_re * right_re + right_im * right_im;
+                float denom        = left_power - 2.0f * center_power + right_power;
+
+                if (std::fabs(denom) > 1e-9f) {
+                    float offset = 0.5f * (left_power - right_power) / denom;
+                    refined_bin += std::clamp(offset, -0.5f, 0.5f);
+                }
+            }
+            frame.peakFrequencyHz =
+                refined_bin * static_cast<float>(CONFIG_UAC_SAMPLE_RATE) / static_cast<float>(spectrum_fft_size);
+        } else {
+            frame.peakFrequencyHz = 0.0f;
+        }
+
+        for (std::size_t band = 0; band < Hal::AudioSpectrumFrame::bandCount; ++band) {
+            float ratio      = _usb_spectrum_raw_bands[band] / _usb_spectrum_normalization_level;
+            float normalized = std::clamp(std::pow(ratio, 0.55f), 0.0f, 1.0f);
+            if (normalized < 0.035f) {
+                normalized = 0.0f;
+            }
+
+            float smooth_alpha = normalized > _usb_spectrum_smoothed_bands[band] ? 0.82f : 0.40f;
+            _usb_spectrum_smoothed_bands[band] += (normalized - _usb_spectrum_smoothed_bands[band]) * smooth_alpha;
+            frame.bands[band] = std::clamp(_usb_spectrum_smoothed_bands[band], 0.0f, 1.0f);
+        }
+    }
+
     i2s_chan_handle_t _tx_handle          = NULL;
     i2s_chan_handle_t _rx_handle          = NULL;
     esp_codec_dev_handle_t _codec_dev     = NULL;
@@ -433,6 +750,23 @@ private:
     float _spectrum_normalization_level                                            = 0.03f;
     bool _spectrum_available                                                       = false;
     bool _is_playing                                                               = false;
+
+    std::atomic<bool> _usb_mic_start_attempted = false;
+    std::atomic<bool> _usb_mic_ready           = false;
+    std::atomic<bool> _usb_mic_muted           = true;
+    std::atomic<bool> _usb_mic_error           = false;
+    std::mutex _usb_spectrum_mutex;
+    std::vector<int16_t> _usb_mic_source_buffer;
+    Hal::AudioSpectrumFrame _usb_mic_spectrum;
+    std::array<float, spectrum_fft_size> _usb_spectrum_time_domain                     = {};
+    std::array<float, spectrum_fft_size * 2> _usb_spectrum_fft_buffer                  = {};
+    std::array<float, Hal::AudioSpectrumFrame::bandCount> _usb_spectrum_raw_bands      = {};
+    std::array<float, Hal::AudioSpectrumFrame::bandCount> _usb_spectrum_smoothed_bands = {};
+    std::array<float, Hal::AudioSpectrumFrame::bandCount> _usb_spectrum_noise_floor    = {};
+    std::array<int, Hal::AudioSpectrumFrame::bandCount + 1> _usb_band_bin_edges        = {};
+    std::size_t _usb_spectrum_samples_ready                                            = 0;
+    float _usb_spectrum_normalization_level                                            = 0.03f;
+    bool _usb_spectrum_available                                                       = false;
 } _audio_codec;
 
 void Hal::audio_init()
@@ -494,6 +828,31 @@ int Hal::getAudioSampleRate()
 void Hal::updateAudioSpectrum()
 {
     _audio_codec.updateSpectrum(_audio_spectrum);
+}
+
+bool Hal::startUsbMic()
+{
+    return _audio_codec.startUsbMic();
+}
+
+void Hal::setUsbMicMuted(bool muted)
+{
+    _audio_codec.setUsbMicMuted(muted);
+}
+
+bool Hal::isUsbMicMuted()
+{
+    return _audio_codec.isUsbMicMuted();
+}
+
+bool Hal::isUsbMicReady()
+{
+    return _audio_codec.isUsbMicReady();
+}
+
+Hal::AudioSpectrumFrame Hal::getUsbMicSpectrum()
+{
+    return _audio_codec.getUsbMicSpectrum();
 }
 
 namespace {

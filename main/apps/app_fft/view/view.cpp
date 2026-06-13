@@ -155,6 +155,17 @@ void FftView::setPeakFrequencyHz(float frequencyHz)
     applyPeakFrequencyLabel();
 }
 
+void FftView::setCenterText(const char* valueText, const char* unitText)
+{
+    if (_peak_frequency_label) {
+        _peak_frequency_label->setText(valueText != nullptr ? valueText : "");
+    }
+
+    if (_peak_frequency_unit_label) {
+        _peak_frequency_unit_label->setText(unitText != nullptr ? unitText : "");
+    }
+}
+
 void FftView::toggleCenterLabels()
 {
     _show_center_labels = !_show_center_labels;
