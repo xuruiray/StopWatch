@@ -20,7 +20,7 @@ constexpr int _panel_center               = _panel_size / 2;
 constexpr int _gear_size                  = 300;
 constexpr int _gear_pivot                 = _gear_size / 2;
 constexpr int _gear_teeth                 = 9;
-constexpr int _gear_frame_count           = 32;
+constexpr int _gear_frame_count           = 16;
 constexpr int _gear_touch_radius_min      = 32;
 constexpr int _gear_touch_radius_max      = 178;
 constexpr int _gear_outer_radius          = 139;
@@ -55,8 +55,7 @@ constexpr int _gear_builder_stack_size    = 6144;
 constexpr UBaseType_t _gear_builder_priority = tskIDLE_PRIORITY + 1;
 constexpr int _gear_builder_yield_rows    = 8;
 constexpr int _gear_frame_build_order[]   = {
-    16, 8,  24, 4,  12, 20, 28, 2,  6,  10, 14, 18, 22, 26, 30, 1,
-    3,  5,  7,  9,  11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31,
+    8, 4, 12, 2, 6, 10, 14, 1, 3, 5, 7, 9, 11, 13, 15,
 };
 
 float normalize_delta_degrees(float delta)
