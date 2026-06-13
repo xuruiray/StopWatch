@@ -201,11 +201,6 @@ public:
     {
         return _audio_spectrum;
     }
-    bool startUsbMic();
-    void setUsbMicMuted(bool muted);
-    bool isUsbMicMuted();
-    bool isUsbMicReady();
-    AudioSpectrumFrame getUsbMicSpectrum();
 
     void playBootSfx();
 

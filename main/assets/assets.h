@@ -19,7 +19,6 @@ LV_IMG_DECLARE(icon_clock);
 LV_IMG_DECLARE(icon_setup);
 LV_IMG_DECLARE(icon_imu);
 LV_IMG_DECLARE(icon_fft);
-LV_IMG_DECLARE(icon_usb_mic);
 LV_IMG_DECLARE(icon_stopwatch);
 LV_IMG_DECLARE(icon_badge);
 LV_IMG_DECLARE(icon_lucky_wheel);
