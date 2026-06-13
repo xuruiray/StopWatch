@@ -14,4 +14,5 @@
 #include "app_badge/app_badge.h"
 #include "app_lucky_wheel/app_lucky_wheel.h"
 #include "app_ratchet/app_ratchet.h"
+#include "app_schulte/app_schulte.h"
 #include "apps/app_alarm_clock/app_alarm_clock.h"

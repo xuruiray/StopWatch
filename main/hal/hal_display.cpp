@@ -10,6 +10,7 @@
 #include <lgfx/v1/panel/Panel_AMOLED.hpp>
 #include <smooth_ui_toolkit.hpp>
 #include <uitk/short_namespace.hpp>
+#include <algorithm>
 #include <memory>
 
 static const std::string_view _tag = "HAL-Display";
@@ -268,8 +269,9 @@ Hal::TouchPoint Hal::getTouchPoint()
 
 static SemaphoreHandle_t xGuiSemaphore;
 static std::atomic<bool> _lvgl_update_enabled = false;
+static std::atomic<bool> _center_out_flush_enabled = false;
 
-#define LV_BUFFER_LINE 120
+#define LV_BUFFER_LINE 466
 
 static void lvgl_tick_timer(void *arg)
 {
@@ -289,26 +291,13 @@ static void lvgl_rtos_task(void *pvParameter)
     }
 }
 
-static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+static void write_pixels_chunked(M5GFX &gfx, const lgfx::rgb565_t *src, uint32_t pixels)
 {
-    M5GFX &gfx = *(M5GFX *)lv_display_get_driver_data(disp);
-
-    uint32_t w      = (area->x2 - area->x1 + 1);
-    uint32_t h      = (area->y2 - area->y1 + 1);
-    uint32_t pixels = w * h;
-
-    gfx.startWrite();
-    gfx.setAddrWindow(area->x1, area->y1, w, h);
-
-    // Critical fix: Use safe pixel writing method to avoid M5GFX SIMD optimizations
-    // Break large transfers into small chunks to avoid problematic copy_rgb_fast function
     const uint32_t SAFE_CHUNK_SIZE = 8192;  // 8K pixels per chunk, suitable for small buffer settings
 
     if (pixels > SAFE_CHUNK_SIZE) {
-        // Chunked transmission for large data
-        const lgfx::rgb565_t *src = (const lgfx::rgb565_t *)px_map;
-        uint32_t remaining        = pixels;
-        uint32_t offset           = 0;
+        uint32_t remaining = pixels;
+        uint32_t offset    = 0;
 
         while (remaining > 0) {
             uint32_t chunk_size = (remaining > SAFE_CHUNK_SIZE) ? SAFE_CHUNK_SIZE : remaining;
@@ -317,10 +306,70 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
             remaining -= chunk_size;
         }
     } else {
-        // Direct transmission for small data
-        gfx.writePixels((lgfx::rgb565_t *)px_map, pixels);
+        gfx.writePixels(src, pixels);
+    }
+}
+
+static void write_flush_band(M5GFX &gfx, const lv_area_t *area, const lgfx::rgb565_t *src, uint32_t width,
+                             int localY, int height)
+{
+    if (height <= 0) {
+        return;
     }
 
+    gfx.setAddrWindow(area->x1, area->y1 + localY, width, height);
+    write_pixels_chunked(gfx, src + static_cast<uint32_t>(localY) * width, width * static_cast<uint32_t>(height));
+}
+
+static void write_area_top_down(M5GFX &gfx, const lv_area_t *area, const lgfx::rgb565_t *src, uint32_t width,
+                                uint32_t height)
+{
+    gfx.setAddrWindow(area->x1, area->y1, width, height);
+    write_pixels_chunked(gfx, src, width * height);
+}
+
+static void write_area_center_out(M5GFX &gfx, const lv_area_t *area, const lgfx::rgb565_t *src, uint32_t width,
+                                  uint32_t height)
+{
+    constexpr int band_lines = 12;
+    const int h             = static_cast<int>(height);
+    const int center        = h / 2;
+    const int first_y       = std::max(0, center - band_lines / 2);
+    const int first_h       = std::min(band_lines, h - first_y);
+
+    write_flush_band(gfx, area, src, width, first_y, first_h);
+
+    int up   = first_y;
+    int down = first_y + first_h;
+    while (up > 0 || down < h) {
+        if (up > 0) {
+            const int y = std::max(0, up - band_lines);
+            write_flush_band(gfx, area, src, width, y, up - y);
+            up = y;
+        }
+
+        if (down < h) {
+            const int band_h = std::min(band_lines, h - down);
+            write_flush_band(gfx, area, src, width, down, band_h);
+            down += band_h;
+        }
+    }
+}
+
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    M5GFX &gfx = *(M5GFX *)lv_display_get_driver_data(disp);
+
+    const uint32_t w = (area->x2 - area->x1 + 1);
+    const uint32_t h = (area->y2 - area->y1 + 1);
+    const auto *src  = reinterpret_cast<const lgfx::rgb565_t *>(px_map);
+
+    gfx.startWrite();
+    if (_center_out_flush_enabled && w >= 300 && h >= 180) {
+        write_area_center_out(gfx, area, src, w, h);
+    } else {
+        write_area_top_down(gfx, area, src, w, h);
+    }
     gfx.endWrite();
 
     lv_display_flush_ready(disp);
@@ -355,10 +404,14 @@ void Hal::lvgl_init()
     lv_display_set_driver_data(disp, _display.get());
     lv_display_set_flush_cb(disp, lvgl_flush_cb);
 
-    static uint8_t *buf1 = (uint8_t *)heap_caps_malloc(_display->width() * LV_BUFFER_LINE, MALLOC_CAP_SPIRAM);
-    static uint8_t *buf2 = (uint8_t *)heap_caps_malloc(_display->width() * LV_BUFFER_LINE, MALLOC_CAP_SPIRAM);
-    lv_display_set_buffers(disp, (void *)buf1, (void *)buf2, _display->width() * LV_BUFFER_LINE,
-                           LV_DISPLAY_RENDER_MODE_PARTIAL);
+    const size_t lvgl_buffer_size = static_cast<size_t>(_display->width()) * LV_BUFFER_LINE * sizeof(lv_color_t);
+    static uint8_t *buf1          = (uint8_t *)heap_caps_malloc(lvgl_buffer_size, MALLOC_CAP_SPIRAM);
+    static uint8_t *buf2          = (uint8_t *)heap_caps_malloc(lvgl_buffer_size, MALLOC_CAP_SPIRAM);
+    if (buf1 == nullptr || buf2 == nullptr) {
+        printf("lvgl display buffer malloc failed\n");
+        return;
+    }
+    lv_display_set_buffers(disp, (void *)buf1, (void *)buf2, lvgl_buffer_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     lvTouchpad = lv_indev_create();
     LV_ASSERT_MALLOC(lvTouchpad);
@@ -386,6 +439,11 @@ void Hal::lvgl_init()
         screen.setBgColor(lv_color_black());
         GetHAL().bootLogo = std::make_unique<BootLogo>();
     }
+}
+
+void Hal::setCenterOutFlushEnabled(bool enabled)
+{
+    _center_out_flush_enabled = enabled;
 }
 
 bool Hal::lvglLock()

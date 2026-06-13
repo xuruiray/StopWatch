@@ -175,6 +175,7 @@ public:
     void lvglUnlock();
     void startLvglUpdate();
     void stopLvglUpdate();
+    void setCenterOutFlushEnabled(bool enabled);
 
     /* ---------------------------------- Touch --------------------------------- */
     struct TouchPoint {
