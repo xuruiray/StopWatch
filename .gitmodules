@@ -1,3 +1,6 @@
 [submodule "Schulte-StopWatch"]
 	path = Schulte-StopWatch
 	url = https://github.com/xuruiray/Schulte-StopWatch.git
+[submodule "Ratchet-StopWatch"]
+	path = Ratchet-StopWatch
+	url = https://github.com/xuruiray/Ratchet-StopWatch.git
