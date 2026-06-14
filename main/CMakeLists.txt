@@ -10,8 +10,8 @@ file(GLOB_RECURSE MY_SRCS
     "hal/*.cpp"
 )
 
-set(SCHULTE_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/../Schulte-StopWatch/hardware/mooncake/main")
-set(RATCHET_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/../Ratchet-StopWatch/hardware/mooncake/main")
+set(SCHULTE_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/../thirdparty/Schulte-StopWatch/hardware/mooncake/main")
+set(RATCHET_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/../thirdparty/Ratchet-StopWatch/hardware/mooncake/main")
 if(NOT EXISTS "${RATCHET_MODULE_DIR}/apps/app_ratchet/app_ratchet.cpp")
     message(FATAL_ERROR "Ratchet-StopWatch submodule is missing. Run: git submodule update --init --recursive")
 endif()
